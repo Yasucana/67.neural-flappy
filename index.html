@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Neuro Flappy — Evolve a Neural Network to Play</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{
+    --bg:#0b1020; --panel:#121a2e; --ink:#e6ecff; --accent:#58a6ff; --muted:#7a88b8; --good:#42d392; --bad:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#0b1020 0%,#0e1430 100%);color:var(--ink)}
+  header{padding:14px 18px;border-bottom:1px solid #233055;background:rgba(0,0,0,.25);backdrop-filter: blur(6px);position:sticky;top:0;z-index:2}
+  header h1{margin:0;font-size:18px;letter-spacing:.5px}
+  .wrap{display:grid;grid-template-columns: minmax(640px,1fr) 360px;gap:14px;padding:14px;align-items:start}
+  canvas{background:linear-gradient(#5cc3ff,#bfe8ff);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.35)}
+  .side{display:flex;flex-direction:column;gap:14px}
+  .card{background:var(--panel);border:1px solid #233055;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.25)}
+  .card h2{font-size:14px;margin:12px 12px 0 12px;color:#cfe0ff}
+  .card .body{padding:12px}
+  .row{display:flex;gap:10px;align-items:center;margin:8px 0}
+  .row label{font-size:12px;color:var(--muted);min-width:110px}
+  .row input[type=range]{width:100%}
+  .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+  button{
+    padding:8px 10px;border-radius:10px;border:1px solid #24345e;background:#16213d;color:#dbe6ff;
+    cursor:pointer;font-weight:600;letter-spacing:.25px;transition:.2s transform,.2s background
+  }
+  button:hover{transform:translateY(-1px);background:#1a2750}
+  .pill{display:inline-block;padding:4px 8px;border:1px solid #2a3a68;background:#141e3a;border-radius:999px;font-size:12px;color:#cbd8ff;margin-right:6px}
+  .stat{font-variant-numeric:tabular-nums}
+  .legend{font-size:12px;color:var(--muted)}
+  small{color:var(--muted)}
+  .footer{padding:8px 14px;color:#9fb1e6}
+  a{color:var(--accent);text-decoration:none}
+</style>
+</head>
+<body>
+<header><h1>Neuro Flappy — Genetic NN learns to dodge pipes</h1></header>
+
+<div class="wrap">
+  <canvas id="game" width="900" height="520"></canvas>
+
+  <div class="side">
+    <div class="card">
+      <h2>Controls</h2>
+      <div class="body">
+        <div class="row"><label>Sim Speed</label><input id="speed" type="range" min="1" max="200" value="1"><span id="speedVal" class="pill">1×</span></div>
+        <div class="row"><label>Population</label><input id="pop" type="range" min="10" max="200" value="80"><span id="popVal" class="pill">80</span></div>
+        <div class="row"><label>Mutation Rate</label><input id="mut" type="range" min="0" max="100" value="10"><span id="mutVal" class="pill">10%</span></div>
+        <div class="row"><label>Elites</label><input id="elite" type="range" min="1" max="30" value="8"><span id="eliteVal" class="pill">8</span></div>
+        <div class="row"><label>Ghosts (draw all)</label><input id="ghosts" type="checkbox" checked></div>
+        <div class="btns">
+          <button id="toggle">▶ Start</button>
+          <button id="nextGen">⟳ Force Next Gen</button>
+          <button id="reset">✦ Reset All</button>
+        </div>
+        <div style="margin-top:10px">
+          <span class="pill stat">Gen: <span id="gen">1</span></span>
+          <span class="pill stat">Alive: <span id="alive">0</span></span>
+          <span class="pill stat">Best: <span id="best">0</span></span>
+          <span class="pill stat">Avg: <span id="avg">0</span></span>
+        </div>
+        <div class="legend" style="margin-top:8px">
+          Best agent is bright; others are translucent (ghosts). Fitness = distance survived and pipes passed.
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Fitness (last 60 gens)</h2>
+      <div class="body">
+        <canvas id="chart" width="320" height="120"></canvas>
+        <div class="legend">Green: Best | Blue: Average</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Current Best Network</h2>
+      <div class="body">
+        <canvas id="net" width="320" height="220"></canvas>
+        <small>Inputs: distance, gapY, birdY, velocity, bias → Hidden(8) → Output(jump?). Line color shows weight sign; thickness shows magnitude.</small>
+      </div>
+    </div>
+
+    <div class="footer">
+      Tip: increase <b>Sim Speed</b> to 50–150× for quick evolution; once it looks good, drop to 1–2× to watch it play.
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===========================
+   Core game parameters
+=========================== */
+const W = 900, H = 520;
+const GRAVITY = 0.5, FLAP = -8.5;
+const PIPE_W = 70, GAP_MIN = 140, GAP_MAX = 200;
+const PIPE_SPACING = 210; // pixels between pipes
+const SCROLL = 3.2;
+
+const INPUTS = 5;     // dist, gapY, birdY, velY, bias(=1)
+const HIDDEN = 8;
+const OUTPUTS = 1;
+
+const rand = (a=1,b=0)=>Math.random()*(a-b)+b;
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const sigmoid = x => 1/(1+Math.exp(-x));
+const tanh = x => Math.tanh(x);
+
+/* ===========================
+   Neural Net + Genome
+=========================== */
+class NeuralNet{
+  constructor(w1=null,b1=null,w2=null,b2=null){
+    this.w1 = w1 || Array.from({length:HIDDEN},()=>Array.from({length:INPUTS},()=>rand(.8,-.8)));
+    this.b1 = b1 || Array.from({length:HIDDEN},()=>rand(.5,-.5));
+    this.w2 = w2 || Array.from({length:OUTPUTS},()=>Array.from({length:HIDDEN},()=>rand(.8,-.8)));
+    this.b2 = b2 || Array.from({length:OUTPUTS},()=>rand(.5,-.5));
+  }
+  clone(){
+    return new NeuralNet(
+      this.w1.map(r=>r.slice()),
+      this.b1.slice(),
+      this.w2.map(r=>r.slice()),
+      this.b2.slice()
+    );
+  }
+  forward(inputs){
+    // inputs: array length INPUTS
+    const h = new Array(HIDDEN);
+    for(let i=0;i<HIDDEN;i++){
+      let s=this.b1[i];
+      const wi=this.w1[i];
+      for(let j=0;j<INPUTS;j++) s+=wi[j]*inputs[j];
+      h[i]=tanh(s);
+    }
+    let out = new Array(OUTPUTS);
+    for(let k=0;k<OUTPUTS;k++){
+      let s=this.b2[k];
+      const wk=this.w2[k];
+      for(let i=0;i<HIDDEN;i++) s+=wk[i]*h[i];
+      out[k]=sigmoid(s);
+    }
+    return out;
+  }
+  static crossover(a,b){
+    const child=a.clone();
+    // one-point crossover per matrix/vector
+    const xMat=(A,B)=>A.map((row,i)=>{
+      const cut=Math.floor(rand(row.length));
+      return row.map((v,j)=> (j<cut? v : B[i][j]));
+    });
+    const xVec=(A,B)=>A.map((v,i)=> (i<Math.floor(rand(A.length))? v : B[i]));
+    child.w1 = xMat(a.w1,b.w1);
+    child.w2 = xMat(a.w2,b.w2);
+    child.b1 = xVec(a.b1,b.b1);
+    child.b2 = xVec(a.b2,b.b2);
+    return child;
+  }
+  mutate(rate, mag=0.4){
+    const mVal = ()=>(Math.random()<rate? rand(mag,-mag):0);
+    const addNoiseMat = (M)=>M.map(row=>row.map(v=>v+mVal()));
+    const addNoiseVec = (V)=>V.map(v=>v+mVal());
+    this.w1 = addNoiseMat(this.w1);
+    this.w2 = addNoiseMat(this.w2);
+    this.b1 = addNoiseVec(this.b1);
+    this.b2 = addNoiseVec(this.b2);
+  }
+}
+
+/* ===========================
+   Environment
+=========================== */
+class Pipe{
+  constructor(x){
+    this.x = x;
+    this.gap = rand(GAP_MAX,GAP_MIN);
+    this.gapY = rand(H*0.75,H*0.25);
+    this.passed=false;
+  }
+  update(){
+    this.x -= SCROLL;
+  }
+  draw(ctx){
+    ctx.fillStyle="#0b6d2f";
+    const topH = this.gapY - this.gap/2;
+    const botY = this.gapY + this.gap/2;
+    // Top
+    ctx.fillRect(this.x, 0, PIPE_W, topH);
+    // Bottom
+    ctx.fillRect(this.x, botY, PIPE_W, H - botY);
+    // Lips
+    ctx.fillStyle="#0f8a3c";
+    ctx.fillRect(this.x-4, topH-12, PIPE_W+8,12);
+    ctx.fillRect(this.x-4, botY, PIPE_W+8,12);
+  }
+}
+
+class Bird{
+  constructor(net){
+    this.net = net || new NeuralNet();
+    this.reset();
+  }
+  reset(){
+    this.x = 180;
+    this.y = H/2 + rand(20,-20);
+    this.vy = 0;
+    this.alive = true;
+    this.fitness = 0;
+    this.pipesPassed = 0;
+  }
+  think(world){
+    const p = world.nextPipe(this.x);
+    if(!p) return; // no pipes yet
+    const dist = (p.x + PIPE_W - this.x)/W;               // normalized distance
+    const gapY = (p.gapY)/H;                               // normalized gap center
+    const birdY = (this.y)/H;                              // normalized bird Y
+    const velY = clamp((this.vy+10)/20, -1, 1);            // approx normalize
+    const bias = 1;
+    const out = this.net.forward([dist, gapY, birdY, velY, bias])[0];
+    if(out>0.5) this.flap();
+  }
+  flap(){ this.vy = FLAP; }
+  update(world){
+    if(!this.alive) return;
+    this.vy += GRAVITY;
+    this.y += this.vy;
+
+    // collisions with bounds
+    if(this.y<0 || this.y>H){ this.alive=false; return; }
+
+    // collisions with pipes
+    const p = world.currentPipeForX(this.x);
+    if(p){
+      const topH = p.gapY - p.gap/2;
+      const botY = p.gapY + p.gap/2;
+      const withinX = (this.x > p.x-16) && (this.x < p.x+PIPE_W+16);
+      const hitTop = this.y < topH;
+      const hitBot = this.y > botY;
+      if(withinX && (hitTop || hitBot)) this.alive=false;
+      if(!p.passed && this.x > p.x + PIPE_W){
+        p.passed = true;
+        this.pipesPassed++;
+      }
+    }
+    // fitness: distance + strong reward for passing pipes
+    this.fitness += 1 + (this.pipesPassed*5);
+  }
+  draw(ctx, highlight=false){
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.globalAlpha = highlight? 1 : 0.25;
+    // body
+    ctx.fillStyle = highlight? "#ffdf5d" : "#ffd94b";
+    ctx.beginPath(); ctx.arc(0,0,12,0,Math.PI*2); ctx.fill();
+    // belly
+    ctx.fillStyle="#fff8d6"; ctx.beginPath(); ctx.arc(3,3,7,0,Math.PI*2); ctx.fill();
+    // eye
+    ctx.fillStyle="#111"; ctx.beginPath(); ctx.arc(4,-3,2.3,0,Math.PI*2); ctx.fill();
+    // beak
+    ctx.fillStyle= highlight? "#ff914d" : "#ff9e63";
+    ctx.beginPath(); ctx.moveTo(12,-2); ctx.lineTo(20,1); ctx.lineTo(12,4); ctx.closePath(); ctx.fill();
+    // wing
+    ctx.fillStyle= highlight? "#ffcd3d" : "#ffcd3d";
+    const flap = Math.sin(Date.now()/80 + this.y/50)*4;
+    ctx.beginPath(); ctx.ellipse(-5,2+flap,8,5,0,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+class World{
+  constructor(popSize){
+    this.popSize = popSize;
+    this.pipes = [];
+    this.birds = [];
+    this.ticks = 0;
+    this.spawnX = 600;
+    this.best = null;
+    this.resetPopulation();
+  }
+  resetPopulation(n=this.popSize, seeds=[]){
+    this.birds = [];
+    for(let i=0;i<n;i++){
+      const net = seeds[i] ? seeds[i] : new NeuralNet();
+      const b = new Bird(net);
+      this.birds.push(b);
+    }
+    this.resetLevel();
+  }
+  resetLevel(){
+    this.pipes = [];
+    for(let i=0;i<6;i++) this.pipes.push(new Pipe(this.spawnX + i*PIPE_SPACING));
+    this.ticks = 0;
+  }
+  step(){
+    this.ticks++;
+    // Move pipes & respawn
+    for(const p of this.pipes) p.update();
+    if(this.pipes[0].x + PIPE_W < -10){
+      this.pipes.shift();
+      this.pipes.push(new Pipe(this.pipes.at(-1).x + PIPE_SPACING));
+    }
+    // Birds think & update
+    for(const b of this.birds){
+      if(!b.alive) continue;
+      b.think(this);
+      b.update(this);
+    }
+  }
+  living(){ return this.birds.filter(b=>b.alive); }
+  allDead(){ return this.living().length===0; }
+  nextPipe(x){
+    for(const p of this.pipes){
+      if(p.x + PIPE_W >= x-6) return p;
+    }
+    return null;
+  }
+  currentPipeForX(x){ return this.nextPipe(x); }
+  computeStats(){
+    let best = this.birds[0], sum=0;
+    for(const b of this.birds){ sum += b.fitness; if(b.fitness>best.fitness) best=b; }
+    this.best = best;
+    return {best:best.fitness|0, avg:(sum/this.birds.length)|0};
+  }
+}
+
+/* ===========================
+   Evolution Manager
+=========================== */
+class GA{
+  constructor(){
+    this.generation = 1;
+    this.history = []; // {best, avg}
+    this.elites = 8;
+    this.mutationRate = 0.10;
+    this.pop = 80;
+  }
+  evolveFrom(world){
+    const birds = world.birds.slice().sort((a,b)=>b.fitness - a.fitness);
+    const elites = birds.slice(0, this.elites).map(b=>b.net.clone());
+    const pool = birds.slice(0, Math.max(this.elites, Math.floor(birds.length*0.5))); // top 50% for parents
+    // helper: tournament
+    const pick = ()=>{
+      const k=3;
+      let best=null;
+      for(let i=0;i<k;i++){
+        const cand = pool[(Math.random()*pool.length)|0];
+        if(!best || cand.fitness>best.fitness) best=cand;
+      }
+      return best.net;
+    };
+    const children = [];
+    while(children.length + elites.length < this.pop){
+      const A = pick(), B = pick();
+      const child = NeuralNet.crossover(A,B);
+      child.mutate(this.mutationRate, 0.6);
+      children.push(child);
+    }
+    // new seeds = elites + children
+    const seeds = elites.concat(children);
+    this.generation++;
+    const stats = world.computeStats();
+    this.history.push({best:stats.best, avg:stats.avg});
+    return seeds;
+  }
+}
+
+/* ===========================
+   Rendering & UI
+=========================== */
+const gameCanvas = document.getElementById('game');
+const ctx = gameCanvas.getContext('2d');
+
+const chartCanvas = document.getElementById('chart');
+const cctx = chartCanvas.getContext('2d');
+
+const netCanvas = document.getElementById('net');
+const nctx = netCanvas.getContext('2d');
+
+const speedEl = document.getElementById('speed');
+const speedVal = document.getElementById('speedVal');
+const popEl = document.getElementById('pop');
+const popVal = document.getElementById('popVal');
+const mutEl = document.getElementById('mut');
+const mutVal = document.getElementById('mutVal');
+const eliteEl = document.getElementById('elite');
+const eliteVal = document.getElementById('eliteVal');
+const ghostsEl = document.getElementById('ghosts');
+
+const genEl = document.getElementById('gen');
+const aliveEl = document.getElementById('alive');
+const bestEl = document.getElementById('best');
+const avgEl = document.getElementById('avg');
+
+const toggleBtn = document.getElementById('toggle');
+const nextGenBtn = document.getElementById('nextGen');
+const resetBtn = document.getElementById('reset');
+
+let running = false;
+let stepsPerFrame = 1;
+
+const ga = new GA();
+let world = new World(ga.pop);
+
+// UI bindings
+function syncUI(){
+  speedVal.textContent = `${stepsPerFrame}×`;
+  popVal.textContent = `${ga.pop}`;
+  mutVal.textContent = `${Math.round(ga.mutationRate*100)}%`;
+  eliteVal.textContent = `${ga.elites}`;
+  genEl.textContent = `${ga.generation}`;
+  const s = world.computeStats();
+  bestEl.textContent = s.best;
+  avgEl.textContent = s.avg;
+  aliveEl.textContent = world.living().length;
+}
+speedEl.oninput = ()=>{ stepsPerFrame = parseInt(speedEl.value,10); speedVal.textContent = `${stepsPerFrame}×`; };
+popEl.oninput = ()=>{
+  ga.pop = parseInt(popEl.value,10);
+  popVal.textContent = `${ga.pop}`;
+};
+mutEl.oninput = ()=>{
+  ga.mutationRate = parseInt(mutEl.value,10)/100;
+  mutVal.textContent = `${mutEl.value}%`;
+};
+eliteEl.oninput = ()=>{
+  ga.elites = parseInt(eliteEl.value,10);
+  eliteVal.textContent = `${ga.elites}`;
+};
+
+toggleBtn.onclick = ()=>{
+  running = !running;
+  toggleBtn.textContent = running? '⏸ Pause' : '▶ Start';
+};
+nextGenBtn.onclick = ()=>{
+  const seeds = ga.evolveFrom(world);
+  world = new World(ga.pop);
+  world.resetPopulation(ga.pop, seeds);
+  genEl.textContent = `${ga.generation}`;
+  drawChart();
+};
+resetBtn.onclick = ()=>{
+  ga.generation = 1;
+  ga.history = [];
+  world = new World(ga.pop);
+  drawChart();
+  running = false;
+  toggleBtn.textContent = '▶ Start';
+};
+
+// Draw background & ground parallax
+let bgOffset = 0;
+function drawWorld(){
+  // sky gradient already in canvas bg
+  // distant hills
+  bgOffset = (bgOffset + SCROLL*0.25) % W;
+  ctx.save();
+  ctx.globalAlpha = 0.3;
+  ctx.fillStyle = "#0c2f66";
+  for(let i=-1;i<4;i++){
+    const x = i*W - bgOffset;
+    ctx.beginPath();
+    ctx.moveTo(x, H-140);
+    ctx.bezierCurveTo(x+200,H-220, x+400,H-100, x+600,H-150);
+    ctx.lineTo(x+W, H); ctx.lineTo(x, H); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+
+  // ground
+  ctx.fillStyle = "#248b3a";
+  ctx.fillRect(0, H-18, W, 18);
+  ctx.fillStyle = "#1e7631";
+  for(let i=0;i<W;i+=20) ctx.fillRect((i - (bgOffset*2)%20), H-20, 12, 20);
+}
+
+function render(){
+  ctx.clearRect(0,0,W,H);
+  drawWorld();
+
+  // pipes
+  for(const p of world.pipes) p.draw(ctx);
+
+  // birds
+  const best = world.best || world.computeStats() && world.best;
+  for(const b of world.birds){
+    const highlight = (b===best);
+    if(!ghostsEl.checked && !highlight) continue;
+    if(!b.alive && !highlight && ghostsEl.checked){
+      ctx.save(); ctx.globalAlpha = 0.08; b.draw(ctx,false); ctx.restore();
+    }else{
+      b.draw(ctx, highlight);
+    }
+  }
+
+  // HUD
+  ctx.fillStyle = "rgba(0,0,0,.15)";
+  ctx.fillRect(10,10,190,86);
+  ctx.fillStyle = "#e9f1ff";
+  ctx.font = "12px Inter, system-ui, Arial";
+  ctx.fillText(`Gen: ${ga.generation}`, 16, 28);
+  ctx.fillText(`Alive: ${world.living().length}/${ga.pop}`, 16, 46);
+  const s = world.computeStats();
+  ctx.fillText(`Best: ${s.best}`, 16, 64);
+  ctx.fillText(`Avg: ${s.avg}`, 16, 82);
+}
+
+// Fitness chart
+function drawChart(){
+  cctx.clearRect(0,0,chartCanvas.width,chartCanvas.height);
+  const data = ga.history.slice(-60);
+  const pad=8, w=chartCanvas.width - pad*2, h=chartCanvas.height - pad*2;
+  if(!data.length) return;
+  const max = Math.max(...data.map(d=>d.best)) || 1;
+  const min = 0;
+  const xStep = w / Math.max(1,data.length-1);
+  // avg line
+  cctx.beginPath();
+  data.forEach((d,i)=>{
+    const x = pad + i*xStep;
+    const y = pad + h - (h*(d.avg-min)/(max-min+1e-6));
+    if(i===0) cctx.moveTo(x,y); else cctx.lineTo(x,y);
+  });
+  cctx.lineWidth=2; cctx.strokeStyle="#5aa0ff"; cctx.stroke();
+  // best line
+  cctx.beginPath();
+  data.forEach((d,i)=>{
+    const x = pad + i*xStep;
+    const y = pad + h - (h*(d.best-min)/(max-min+1e-6));
+    if(i===0) cctx.moveTo(x,y); else cctx.lineTo(x,y);
+  });
+  cctx.lineWidth=2; cctx.strokeStyle="#2bd97d"; cctx.stroke();
+  // axes
+  cctx.strokeStyle="rgba(255,255,255,.15)";
+  cctx.lineWidth=1;
+  cctx.strokeRect(pad,pad,w,h);
+}
+
+// Network visualization for current best
+function drawNet(net){
+  nctx.clearRect(0,0,netCanvas.width,netCanvas.height);
+  if(!net) return;
+  const Wn = netCanvas.width, Hn = netCanvas.height;
+  const layerX = [40, 160, 300];
+  const inY = Array.from({length:INPUTS},(_,i)=>20 + i*((Hn-40)/(INPUTS-1)));
+  const hidY = Array.from({length:HIDDEN},(_,i)=>20 + i*((Hn-40)/(HIDDEN-1)));
+  const outY = [Hn/2];
+
+  // connections input->hidden
+  for(let i=0;i<HIDDEN;i++){
+    for(let j=0;j<INPUTS;j++){
+      const w = net.w1[i][j];
+      nctx.beginPath();
+      nctx.moveTo(layerX[0], inY[j]);
+      nctx.lineTo(layerX[1], hidY[i]);
+      nctx.strokeStyle = w>=0? "rgba(66,211,146,.7)" : "rgba(255,107,107,.7)";
+      nctx.lineWidth = Math.max(0.5, Math.min(4, Math.abs(w)*2));
+      nctx.stroke();
+    }
+  }
+  // connections hidden->out
+  for(let k=0;k<OUTPUTS;k++){
+    for(let i=0;i<HIDDEN;i++){
+      const w = net.w2[k][i];
+      nctx.beginPath();
+      nctx.moveTo(layerX[1], hidY[i]);
+      nctx.lineTo(layerX[2], outY[k]);
+      nctx.strokeStyle = w>=0? "rgba(66,211,146,.8)" : "rgba(255,107,107,.8)";
+      nctx.lineWidth = Math.max(0.5, Math.min(4, Math.abs(w)*2));
+      nctx.stroke();
+    }
+  }
+
+  // draw nodes
+  const drawNodes=(xs, ys, col)=>{
+    nctx.fillStyle=col; nctx.strokeStyle="rgba(255,255,255,.25)";
+    ys.forEach(y=>{
+      nctx.beginPath(); nctx.arc(xs, y, 7, 0, Math.PI*2); nctx.fill(); nctx.stroke();
+    });
+  };
+  drawNodes(layerX[0], inY, "rgba(90,160,255,.9)");
+  drawNodes(layerX[1], hidY, "rgba(200,220,255,.9)");
+  drawNodes(layerX[2], outY, "rgba(255,220,120,.95)");
+}
+
+/* ===========================
+   Main loop
+=========================== */
+function tick(){
+  if(running){
+    for(let s=0;s<stepsPerFrame;s++){
+      world.step();
+      if(world.allDead()){
+        const seeds = ga.evolveFrom(world);
+        world = new World(ga.pop);
+        world.resetPopulation(ga.pop, seeds);
+        drawChart();
+      }
+    }
+  }
+  syncUI();
+  render();
+  drawNet(world.best?.net);
+  requestAnimationFrame(tick);
+}
+
+// Boot
+syncUI();
+drawChart();
+render();
+requestAnimationFrame(tick);
+
+// Spacebar to toggle
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'){ e.preventDefault(); toggleBtn.click(); }
+});
+</script>
+</body>
+</html>
